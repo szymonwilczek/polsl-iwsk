@@ -29,10 +29,11 @@ if(CMAKE_EXPORT_COMPILE_COMMANDS)
     endif()
 endif()
 
+# =================
+# abstraction layer 
+# =================
 add_library(serial_hal STATIC
     src/hal/serial_hal_linux.c
-    src/rs232/rs232_logic.c
-    src/protocol/modbus_core.c
 )
 
 target_include_directories(serial_hal
@@ -45,3 +46,32 @@ if(MSVC)
 else()
     target_compile_options(serial_hal PRIVATE -Wall -Wextra -Wpedantic)
 endif()
+
+# ===============
+# executable file 
+# ===============
+add_executable(polsl_iwsk_app
+    src/main.c
+    src/rs232/rs232_logic.c
+    src/protocol/modbus_core.c
+)
+
+target_include_directories(polsl_iwsk_app
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+if(MSVC)
+    target_compile_options(polsl_iwsk_app PRIVATE /W4)
+else()
+    target_compile_options(polsl_iwsk_app PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+# =======
+# linking 
+# =======
+target_link_libraries(polsl_iwsk_app 
+    PRIVATE 
+        serial_hal 
+        pthread
+)
