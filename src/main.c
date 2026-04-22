@@ -15,6 +15,27 @@
 #define ANSI_COLOR_CYAN "\x1b[36m"
 #define ANSI_COLOR_RESET "\x1b[0m"
 
+#ifdef _WIN32
+#include <windows.h>
+#ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
+#define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
+#endif
+
+/**
+ * @brief Enables ANSI color codes in Windows console.
+ */
+static void enable_windows_ansi(void) {
+  HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+  if (hOut != INVALID_HANDLE_VALUE) {
+    DWORD dwMode = 0;
+    if (GetConsoleMode(hOut, &dwMode)) {
+      dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+      SetConsoleMode(hOut, dwMode);
+    }
+  }
+}
+#endif
+
 #define RX_BUFFER_SIZE 512
 
 struct app_context {
@@ -126,6 +147,10 @@ int main(int argc, char **argv) {
 
   memset(&ctx, 0, sizeof(ctx));
   atomic_init(&ctx.is_running, true);
+
+#ifdef _WIN32
+  enable_windows_ansi();
+#endif
 
   /* initialize HAL depending on OS */
 #ifdef _WIN32
