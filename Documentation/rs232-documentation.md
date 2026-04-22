@@ -10,7 +10,7 @@ The project was developed as part of the "Interfejsy w systemach komputerowych" 
 ## 2. Architecture
 The software is divided into three distinct layers to ensure modularity and ease of hardware migration:
 
-* **HAL (Hardware Abstraction Layer):** Isolates OS-specific serial port handling (`termios` for Linux, `WinAPI` for Windows). It provides a unified interface for I/O operations and modem line control. Windows is currently not handled (TBA).
+* **HAL (Hardware Abstraction Layer):** Isolates OS-specific serial port handling (`termios` for Linux, `WinAPI` for Windows). It provides a unified interface for I/O operations and modem line control.
 * **Protocol Engine (MODBUS/RS-232):** A hardware-agnostic layer that handles data framing, checksum (LRC) calculation, and ASCII encoding/decoding.
 * **Presentation Layer (TUI):** A multi-threaded CLI application. The background thread handles asynchronous RX polling, while the main thread manages user input and UI rendering via ANSI escape codes.
 
