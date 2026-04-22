@@ -20,7 +20,7 @@
 #include <stdint.h>
 
 #ifdef _WIN32
-#include <BaseTsd.h>
+#include <basetsd.h>
 typedef SSIZE_T ssize_t;
 #else
 #include <sys/types.h>
