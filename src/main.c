@@ -20,6 +20,7 @@ struct app_context {
   struct serial_hal_device dev;
   atomic_bool is_running;
   pthread_t rx_thread;
+  struct serial_hal_modem_lines current_lines;
 };
 
 /**
@@ -28,12 +29,12 @@ struct app_context {
 static void *rx_worker_thread(void *arg) {
   struct app_context *ctx = (struct app_context *)arg;
   uint8_t rx_buf[RX_BUFFER_SIZE];
-  char ascii_buf[RX_BUFFER_SIZE];
   struct modbus_frame frame;
   ssize_t bytes_read;
   int ret;
 
   while (atomic_load(&ctx->is_running)) {
+    /* non-blocking wait using HAL timeout */
     bytes_read = serial_hal_read(&ctx->dev, rx_buf, sizeof(rx_buf) - 1, 100);
 
     if (bytes_read > 0) {
@@ -95,10 +96,13 @@ static void send_modbus_test_frame(struct app_context *ctx) {
  * @brief Display the main TUI menu.
  */
 static void print_menu(void) {
-  printf("\n" ANSI_COLOR_CYAN "=== IWSK: RS-232 PROJECT ===" ANSI_COLOR_RESET
+  printf("\n" ANSI_COLOR_CYAN "=== IWSK: RS-232 & MODBUS ===" ANSI_COLOR_RESET
          "\n");
   printf("1. Send raw text message\n");
   printf("2. Send test MODBUS ASCII frame (Node 1, Func 1)\n");
+  printf("3. Toggle DTR (Data Terminal Ready) pin\n");
+  printf("4. Toggle RTS (Request To Send) pin\n");
+  printf("5. Read Modem Lines Status (DSR, CTS, etc.)\n");
   printf("q. Quit application\n");
   printf("> ");
   fflush(stdout);
@@ -120,7 +124,7 @@ int main(int argc, char **argv) {
   memset(&ctx, 0, sizeof(ctx));
   atomic_init(&ctx.is_running, true);
 
-  /* HAL for Linux */
+  /* initialize HAL for Linux */
   if (serial_hal_linux_init(&ctx.dev) < 0) {
     fprintf(stderr, "Failed to init Linux HAL.\n");
     return EXIT_FAILURE;
@@ -141,6 +145,11 @@ int main(int argc, char **argv) {
     serial_hal_linux_deinit(&ctx.dev);
     return EXIT_FAILURE;
   }
+
+  /* initial state for DTR/RTS */
+  ctx.current_lines.dtr = true;
+  ctx.current_lines.rts = true;
+  serial_hal_set_modem_lines(&ctx.dev, &ctx.current_lines);
 
   /* background RX thread */
   if (pthread_create(&ctx.rx_thread, NULL, rx_worker_thread, &ctx) != 0) {
@@ -168,6 +177,30 @@ int main(int argc, char **argv) {
       }
     } else if (input[0] == '2') {
       send_modbus_test_frame(&ctx);
+    } else if (input[0] == '3') {
+      ctx.current_lines.dtr = !ctx.current_lines.dtr;
+      serial_hal_set_modem_lines(&ctx.dev, &ctx.current_lines);
+      printf(ANSI_COLOR_YELLOW "[MODEM]" ANSI_COLOR_RESET
+                               " DTR toggled to %d\n",
+             ctx.current_lines.dtr);
+    } else if (input[0] == '4') {
+      ctx.current_lines.rts = !ctx.current_lines.rts;
+      serial_hal_set_modem_lines(&ctx.dev, &ctx.current_lines);
+      printf(ANSI_COLOR_YELLOW "[MODEM]" ANSI_COLOR_RESET
+                               " RTS toggled to %d\n",
+             ctx.current_lines.rts);
+    } else if (input[0] == '5') {
+      struct serial_hal_modem_lines status;
+      if (serial_hal_get_modem_lines(&ctx.dev, &status) == 0) {
+        printf(ANSI_COLOR_YELLOW
+               "[STATUS]" ANSI_COLOR_RESET
+               " DTR:%d RTS:%d | DSR:%d CTS:%d DCD:%d RI:%d\n",
+               status.dtr, status.rts, status.dsr, status.cts, status.dcd,
+               status.ri);
+      } else {
+        printf(ANSI_COLOR_RED "Failed to read modem lines. Emulator might not "
+                              "support it.\n" ANSI_COLOR_RESET);
+      }
     }
   }
 
