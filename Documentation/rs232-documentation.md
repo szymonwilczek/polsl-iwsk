@@ -1,0 +1,70 @@
+# RS-232 and MODBUS ASCII Communication Project
+
+Szymon Wilczek
+
+## 1. Project Overview
+This project implements a serial communication system between two DTE (Data Terminal Equipment) stations. It focuses on the **RS-232** standard and the **MODBUS ASCII** protocol, providing a Hardware Abstraction Layer (HAL) for Linux, a custom protocol engine, and a multi-threaded Text User Interface (TUI).
+
+The project was developed as part of the "Interfejsy w systemach komputerowych" (IWSK) course at the Silesian University of Technology (PolSL).
+
+## 2. Architecture
+The software is divided into three distinct layers to ensure modularity and ease of hardware migration:
+
+* **HAL (Hardware Abstraction Layer):** Isolates OS-specific serial port handling (`termios` for Linux, `WinAPI` for Windows). It provides a unified interface for I/O operations and modem line control. Windows is currently not handled (TBA).
+* **Protocol Engine (MODBUS/RS-232):** A hardware-agnostic layer that handles data framing, checksum (LRC) calculation, and ASCII encoding/decoding.
+* **Presentation Layer (TUI):** A multi-threaded CLI application. The background thread handles asynchronous RX polling, while the main thread manages user input and UI rendering via ANSI escape codes.
+
+## 3. Hardware & Emulation Setup
+
+### 3.1. Emulation (Software-only)
+To test the logic without physical hardware, virtual serial ports are used:
+* **Linux:** Use `socat` to create a virtual null-modem pair:
+    ```bash
+    socat -d -d PTY,link=/tmp/ttyV0,raw,echo=0 PTY,link=/tmp/ttyV1,raw,echo=0
+    ```
+* **Windows:** Use `com0com` to create a virtual COM port pair (e.g., `COM10` <-> `COM11`).
+
+### 3.2. Physical Connection
+The system supports physical communication using:
+* 2x USB-to-RS232 (DB9) adapters.
+* 1x **Null Modem Cable** (Female-to-Female) with full crossover for hardware flow control (TX/RX, RTS/CTS, DTR/DSR).
+
+## 4. Features & TUI Commands
+The application provides an interactive menu:
+1.  **Send raw text:** Transmits a string over the wire.
+2.  **Send MODBUS ASCII:** Encodes and sends a standard Modbus frame (Node 01, Func 01).
+3.  **Toggle DTR:** Manually changes the state of the Data Terminal Ready pin.
+4.  **Toggle RTS:** Manually changes the state of the Request To Send pin.
+5.  **Read Modem Lines:** Polls and displays current states of DSR, CTS, DCD, and RI.
+
+## 5. Verification & Test Scenarios
+
+### Scenario 1: Loopback & Protocol Integrity
+**Goal:** Verify that the Modbus engine correctly encodes and decodes frames.
+1.  Launch `socat` and two instances of the app (`/tmp/ttyV0` and `/tmp/ttyV1`).
+2.  Send a Modbus frame (Option 2) from Station A.
+3.  **Expectation:** Station B displays `[MODBUS VALID]` with correct Address (01) and Function (01). This confirms the **LRC Checksum** calculation is correct.
+
+### Scenario 2: Error Handling (Corrupted Frames)
+**Goal:** Ensure the system rejects invalid protocol data.
+1.  From Station A, send a raw text string (Option 1) formatted as a Modbus frame but with an intentional error in the LRC (e.g., `:01014849FF\\r\\n`).
+2.  **Expectation:** Station B receives the data but labels it as `[RAW TEXT]` instead of `[MODBUS VALID]`. The decoder correctly returns `-EBADMSG` after failing the checksum verification.
+
+### Scenario 3: Hardware Flow Control (Handshake)
+**Goal:** Verify manual control of modem lines as requested.
+1.  Connect two PCs via physical adapters and a Null Modem cable.
+2.  On Station A, toggle DTR (Option 3).
+3.  On Station B, read modem status (Option 5).
+4.  **Expectation:** The **DSR** status on Station B must change in sync with **DTR** on Station A (due to null-modem pin mapping). Similarly, **RTS** on Station A controls **CTS** on Station B. This demonstrates full control over the Data Flow layer.
+
+## 6. Build Instructions
+The project uses CMake for cross-platform builds.
+```bash
+mkdir build && cd build
+cmake ..
+make
+./polsl_iwsk_app /dev/ttyUSB0
+
+#### References:
+- Mielczarek W.: Szeregowe interfejsy cyfrowe, Helion 1993.
+- *Interfejsy w systemach komputerowych cz.1 - Komunikacja przez port znakowy* (Dr inż. Wojciech Mielczarek).
