@@ -31,6 +31,7 @@ endif()
 
 add_library(serial_hal STATIC
     src/hal/serial_hal_linux.c
+    src/rs232/rs232_logic.c
 )
 
 target_include_directories(serial_hal
