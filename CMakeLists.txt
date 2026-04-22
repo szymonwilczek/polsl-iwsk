@@ -33,7 +33,8 @@ endif()
 # abstraction layer 
 # =================
 add_library(serial_hal STATIC
-    src/hal/serial_hal_linux.c
+  src/hal/serial_hal_linux.c
+  src/hal/serial_hal_windows.c
 )
 
 target_include_directories(serial_hal

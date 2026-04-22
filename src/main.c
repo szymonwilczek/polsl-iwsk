@@ -1,5 +1,6 @@
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -113,22 +114,31 @@ int main(int argc, char **argv) {
   struct serial_hal_config cfg;
   char input[256];
   int ret;
+  int exit_code = EXIT_SUCCESS;
+  bool rx_thread_started = false;
 
   if (argc < 2) {
     fprintf(stderr,
             "Usage: %s <serial_port> (e.g. /tmp/ttyV0 or /dev/ttyUSB0)\n",
             argv[0]);
-    return EXIT_FAILURE;
+    return EXIT_FAILURE; /* its fine to return, nothing allocated yet */
   }
 
   memset(&ctx, 0, sizeof(ctx));
   atomic_init(&ctx.is_running, true);
 
-  /* initialize HAL for Linux */
+  /* initialize HAL depending on OS */
+#ifdef _WIN32
+  if (serial_hal_windows_init(&ctx.dev) < 0) {
+    fprintf(stderr, "Failed to init Windows HAL.\n");
+    return EXIT_FAILURE; /* also fine, HAL init failed, nothing to clean up */
+  }
+#else
   if (serial_hal_linux_init(&ctx.dev) < 0) {
     fprintf(stderr, "Failed to init Linux HAL.\n");
     return EXIT_FAILURE;
   }
+#endif
 
   /* configure port parameters (9600 8N1) */
   memset(&cfg, 0, sizeof(cfg));
@@ -142,8 +152,8 @@ int main(int argc, char **argv) {
     fprintf(stderr,
             "Failed to open %s (Error: %d). Check permissions or socat.\n",
             argv[1], ret);
-    serial_hal_linux_deinit(&ctx.dev);
-    return EXIT_FAILURE;
+    exit_code = EXIT_FAILURE;
+    goto cleanup;
   }
 
   /* initial state for DTR/RTS */
@@ -154,10 +164,10 @@ int main(int argc, char **argv) {
   /* background RX thread */
   if (pthread_create(&ctx.rx_thread, NULL, rx_worker_thread, &ctx) != 0) {
     fprintf(stderr, "Failed to spawn RX thread.\n");
-    serial_hal_close(&ctx.dev);
-    serial_hal_linux_deinit(&ctx.dev);
-    return EXIT_FAILURE;
+    exit_code = EXIT_FAILURE;
+    goto cleanup;
   }
+  rx_thread_started = true;
 
   /* main event loop */
   while (atomic_load(&ctx.is_running)) {
@@ -205,9 +215,25 @@ int main(int argc, char **argv) {
   }
 
   printf("Shutting down gracefully...\n");
-  pthread_join(ctx.rx_thread, NULL);
-  serial_hal_close(&ctx.dev);
-  serial_hal_linux_deinit(&ctx.dev);
 
-  return EXIT_SUCCESS;
+cleanup:
+  /* stop and join the thread ONLY if it was successfully started */
+  if (rx_thread_started) {
+    atomic_store(&ctx.is_running, false);
+    pthread_join(ctx.rx_thread, NULL);
+  }
+
+  /* close the port ONLY if its currently open */
+  if (ctx.dev.is_open) {
+    serial_hal_close(&ctx.dev);
+  }
+
+  /* deinitialize the correct HAL */
+#ifdef _WIN32
+  serial_hal_windows_deinit(&ctx.dev);
+#else
+  serial_hal_linux_deinit(&ctx.dev);
+#endif
+
+  return exit_code;
 }

@@ -135,6 +135,22 @@ int serial_hal_linux_init(struct serial_hal_device *dev);
  */
 void serial_hal_linux_deinit(struct serial_hal_device *dev);
 
+/**
+ * @brief Initialize Windows backend object.
+ *
+ * @param dev HAL object to initialize.
+ * @return 0 on success, negative errno otherwise.
+ */
+int serial_hal_windows_init(struct serial_hal_device *dev);
+
+/**
+ * @brief Deinitialize Windows backend and release resources.
+ *
+ * @param dev HAL object previously initialized with serial_hal_windows_init().
+ */
+void serial_hal_windows_deinit(struct serial_hal_device *dev);
+
+
 static inline int serial_hal_open(struct serial_hal_device *dev,
                                   const struct serial_hal_config *cfg) {
   if (!dev || !dev->ops || !dev->ops->open)
