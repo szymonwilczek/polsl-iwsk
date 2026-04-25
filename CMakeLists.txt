@@ -57,6 +57,10 @@ add_executable(polsl_iwsk_app
     src/protocol/modbus_core.c
 )
 
+if(UNIX)
+    set_target_properties(polsl_iwsk_app PROPERTIES OUTPUT_NAME "polsl_iwsk_app_linux")
+endif()
+
 target_include_directories(polsl_iwsk_app
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -76,3 +80,20 @@ target_link_libraries(polsl_iwsk_app
         serial_hal 
         pthread
 )
+
+# ==========================================
+# Cross-compilation for Windows (via MinGW)
+# ==========================================
+if(UNIX)
+    add_custom_target(polsl_iwsk_app_windows ALL
+        COMMAND x86_64-w64-mingw32-gcc
+            ${CMAKE_SOURCE_DIR}/src/main.c
+            ${CMAKE_SOURCE_DIR}/src/hal/serial_hal_windows.c
+            ${CMAKE_SOURCE_DIR}/src/rs232/rs232_logic.c
+            ${CMAKE_SOURCE_DIR}/src/protocol/modbus_core.c
+            -I${CMAKE_SOURCE_DIR}/include
+            -o ${CMAKE_BINARY_DIR}/polsl_iwsk_app.exe
+            -static -lpthread
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    )
+endif()
