@@ -57,15 +57,24 @@ static void *rx_worker_thread(void *arg) {
   int ret;
 
   while (atomic_load(&ctx->is_running)) {
+    size_t space_left = sizeof(rx_buf) - 1 - rx_len;
+    if (space_left == 0) {
+      printf("\n" ANSI_COLOR_RED "[RX ERROR]" ANSI_COLOR_RESET
+             " Buffer overflow! Dropping %zu bytes.\n> ",
+             rx_len);
+      fflush(stdout);
+      rx_len = 0;
+      space_left = sizeof(rx_buf) - 1;
+    }
+
     /* non-blocking wait using HAL timeout */
-    bytes_read = serial_hal_read(&ctx->dev, rx_buf + rx_len,
-                                 sizeof(rx_buf) - 1 - rx_len, 50);
+    bytes_read = serial_hal_read(&ctx->dev, rx_buf + rx_len, space_left, 50);
 
     if (bytes_read > 0) {
       rx_len += bytes_read;
       rx_buf[rx_len] = '\0';
 
-      if (rx_len > 0 && rx_buf[rx_len - 1] == '\n') {
+      if (strchr((char *)rx_buf, '\n') != NULL) {
 
         ret = modbus_ascii_decode((const char *)rx_buf, rx_len, &frame);
 
@@ -81,10 +90,14 @@ static void *rx_worker_thread(void *arg) {
         } else {
           /* fallback as RAW TEXT */
           printf(ANSI_COLOR_YELLOW "[RAW TEXT]" ANSI_COLOR_RESET " %s", rx_buf);
+          if (rx_buf[rx_len - 1] != '\n')
+            printf("\n");
         }
 
         printf("> ");
         fflush(stdout);
+
+        /* flush buffer */
         rx_len = 0;
       }
     }
