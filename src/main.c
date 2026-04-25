@@ -51,38 +51,42 @@ struct app_context {
 static void *rx_worker_thread(void *arg) {
   struct app_context *ctx = (struct app_context *)arg;
   uint8_t rx_buf[RX_BUFFER_SIZE];
+  size_t rx_len = 0;
   struct modbus_frame frame;
   ssize_t bytes_read;
   int ret;
 
   while (atomic_load(&ctx->is_running)) {
     /* non-blocking wait using HAL timeout */
-    bytes_read = serial_hal_read(&ctx->dev, rx_buf, sizeof(rx_buf) - 1, 100);
+    bytes_read = serial_hal_read(&ctx->dev, rx_buf + rx_len,
+                                 sizeof(rx_buf) - 1 - rx_len, 50);
 
     if (bytes_read > 0) {
-      rx_buf[bytes_read] = '\0'; /* null-terminate for safe string ops */
+      rx_len += bytes_read;
+      rx_buf[rx_len] = '\0';
 
-      /* attempt to decode as MODBUS ASCII */
-      ret =
-          modbus_ascii_decode((const char *)rx_buf, (size_t)bytes_read, &frame);
+      if (rx_len > 0 && rx_buf[rx_len - 1] == '\n') {
 
-      printf("\n" ANSI_COLOR_CYAN "[RX EVENT]" ANSI_COLOR_RESET
-             " Received %zd bytes.\n",
-             bytes_read);
+        ret = modbus_ascii_decode((const char *)rx_buf, rx_len, &frame);
 
-      if (ret == 0 && frame.is_valid) {
-        printf(ANSI_COLOR_GREEN "[MODBUS VALID]" ANSI_COLOR_RESET
-                                " Node: %02X | Func: %02X | Data Len: %zu\n",
-               frame.server_address, frame.pdu.function_code,
-               frame.pdu.data_len);
-      } else {
-        /* fallback to raw text printing */
-        printf(ANSI_COLOR_YELLOW "[RAW TEXT]" ANSI_COLOR_RESET " %s\n", rx_buf);
+        printf("\n" ANSI_COLOR_CYAN "[RX EVENT]" ANSI_COLOR_RESET
+               " Received %zu bytes.\n",
+               rx_len);
+
+        if (ret == 0 && frame.is_valid) {
+          printf(ANSI_COLOR_GREEN "[MODBUS VALID]" ANSI_COLOR_RESET
+                                  " Node: %02X | Func: %02X | Data Len: %zu\n",
+                 frame.server_address, frame.pdu.function_code,
+                 frame.pdu.data_len);
+        } else {
+          /* fallback as RAW TEXT */
+          printf(ANSI_COLOR_YELLOW "[RAW TEXT]" ANSI_COLOR_RESET " %s", rx_buf);
+        }
+
+        printf("> ");
+        fflush(stdout);
+        rx_len = 0;
       }
-
-      /* reprint prompt */
-      printf("> ");
-      fflush(stdout);
     }
   }
 
