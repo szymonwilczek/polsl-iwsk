@@ -14,57 +14,92 @@ The software is divided into three distinct layers to ensure modularity and ease
 * **Protocol Engine (MODBUS/RS-232):** A hardware-agnostic layer that handles data framing, checksum (LRC) calculation, and ASCII encoding/decoding.
 * **Presentation Layer (TUI):** A multi-threaded CLI application. The background thread handles asynchronous RX polling, while the main thread manages user input and UI rendering via ANSI escape codes.
 
-## 3. Hardware & Emulation Setup
+## 3. Hardware Setup & Parameters
+The system operates at an industry-standard **9600 bps (8N1)**. This baud rate was chosen as it provides excellent noise immunity and is the default for legacy industrial Modbus equipment. The frame terminator strictly follows the Modbus ASCII specification: **CR LF** (`\r\n`).
 
-### 3.1. Emulation (Software-only)
-To test the logic without physical hardware, virtual serial ports are used:
-* **Linux:** Use `socat` to create a virtual null-modem pair:
-    ```bash
-    socat -d -d PTY,link=/tmp/ttyV0,raw,echo=0 PTY,link=/tmp/ttyV1,raw,echo=0
-    ```
-* **Windows:** Use `com0com` to create a virtual COM port pair (e.g., `COM10` <-> `COM11`).
+### Physical Connection
+The system was successfully tested using a cross-platform hardware setup:
+* 2x **UGREEN CR104 (PL2303)** USB-to-RS232 (DB9) adapters.
+* 1x **Assmann Null Modem Cable** (Female-to-Female) with full crossover for hardware flow control.
 
-### 3.2. Physical Connection
-The system supports physical communication using:
-* 2x USB-to-RS232 (DB9) adapters.
-* 1x **Null Modem Cable** (Female-to-Female) with full crossover for hardware flow control (TX/RX, RTS/CTS, DTR/DSR).
+## 4. Verification & Test Scenarios (Physical Hardware Logs)
 
-## 4. Features & TUI Commands
-The application provides an interactive menu:
-1.  **Send raw text:** Transmits a string over the wire.
-2.  **Send MODBUS ASCII:** Encodes and sends a standard Modbus frame (Node 01, Func 01).
-3.  **Toggle DTR:** Manually changes the state of the Data Terminal Ready pin.
-4.  **Toggle RTS:** Manually changes the state of the Request To Send pin.
-5.  **Read Modem Lines:** Polls and displays current states of DSR, CTS, DCD, and RI.
+The following tests were performed using a physical connection between a Linux workstation (Station A) and a Windows 11 laptop (Station B).
+Also tested as Linux (Station A) and another Linux (Station B). Never tested Windows - Windows, since I don't have that OS on my main machine.
 
-## 5. Verification & Test Scenarios
+### Scenario 1: Loopback & Protocol Integrity (Raw Text & MODBUS)
+**Goal:** Verify that the asynchronous buffer correctly concatenates physical UART byte streams and the Modbus engine calculates the LRC checksum correctly.
 
-### Scenario 1: Loopback & Protocol Integrity
-**Goal:** Verify that the Modbus engine correctly encodes and decodes frames.
-1.  Launch `socat` and two instances of the app (`/tmp/ttyV0` and `/tmp/ttyV1`).
-2.  Send a Modbus frame (Option 2) from Station A.
-3.  **Expectation:** Station B displays `[MODBUS VALID]` with correct Address (01) and Function (01). This confirms the **LRC Checksum** calculation is correct.
+**Test Log (Linux to Windows):**
+
+```text
+> 2
+[TX] Modbus frame sent: :010148496D
+
+[RX EVENT] Received 13 bytes.
+[MODBUS VALID] Node: 01 | Func: 01 | Data Len: 2
+```
+
+*Note:* The RX buffer uses `strchr()` to find the `\n` terminator, solving hardware fragmentation where bytes arrive sequentially (1 ms per byte at 9600 bps) rather than instantaneously as in a software emulator.
 
 ### Scenario 2: Error Handling (Corrupted Frames)
-**Goal:** Ensure the system rejects invalid protocol data.
-1.  From Station A, send a raw text string (Option 1) formatted as a Modbus frame but with an intentional error in the LRC (e.g., `:01014849FF\\r\\n`).
-2.  **Expectation:** Station B receives the data but labels it as `[RAW TEXT]` instead of `[MODBUS VALID]`. The decoder correctly returns `-EBADMSG` after failing the checksum verification.
 
-### Scenario 3: Hardware Flow Control (Handshake)
-**Goal:** Verify manual control of modem lines as requested.
-1.  Connect two PCs via physical adapters and a Null Modem cable.
-2.  On Station A, toggle DTR (Option 3).
-3.  On Station B, read modem status (Option 5).
-4.  **Expectation:** The **DSR** status on Station B must change in sync with **DTR** on Station A (due to null-modem pin mapping). Similarly, **RTS** on Station A controls **CTS** on Station B. This demonstrates full control over the Data Flow layer.
+**Goal:** Ensure the system rejects invalid protocol data based on LRC checksum mismatch.
+**Test Execution:** A raw text string mimicking a Modbus frame with an intentional LRC error (`:01014849FF\r\n`) was sent.
+**Result:** The receiver correctly labeled it as `[RAW TEXT]` instead of `[MODBUS VALID]`, proving the `-EBADMSG` protocol engine rejection works properly.
 
-## 6. Build Instructions
+### Scenario 3: Hardware Flow Control (Handshake) & OS Quirks
+
+**Goal:** Verify physical control of modem lines using HAL (`TIOCMSET` on Linux / `EscapeCommFunction` on WinAPI).
+
+#### Hardware Test 1: RTS -> CTS Flow
+
+**Action:** Toggled RTS on Linux, read state on Windows.
+
+```text
+Linux:
+> 4
+[MODEM] RTS toggled to 0
+
+Windows:
+> 5
+[STATUS] DTR:0 RTS:0 | DSR:0 CTS:0 DCD:0 RI:0
+```
+
+**Result:** Setting RTS to 0 on Linux successfully pulled the physical CTS line down to 0 on Windows, proving true hardware flow control.
+
+#### Hardware Test 2: DTR -> DCD Cross-Wiring (Cable Specifics)
+
+**Action:** Toggled DTR on Linux, read state on Windows.
+
+```text
+Linux:
+> 3
+[MODEM] DTR toggled to 0
+
+Windows:
+> 5
+[STATUS] DTR:0 RTS:0 | DSR:0 CTS:1 DCD:0 RI:0
+```
+
+*Notes (OS & Hardware Quirks):*
+
+1. **Cable Crossover:** Changing DTR on the sender changed DCD (Data Carrier Detect) on the receiver, not DSR. This is a common feature in some Null-Modem cables, simulating carrier detection.
+2. **WinAPI vs termios:** In the Windows log, DTR and RTS read as `0` locally. This is because Windows' `GetCommModemStatus` only reports *input pins* from the device, whereas Linux's `ioctl(TIOCMGET)` returns the state of **both** input and output registers.
+
+## 5. Build Instructions
+
 The project uses CMake for cross-platform builds.
+
 ```bash
 mkdir build && cd build
 cmake ..
 make
-./polsl_iwsk_app /dev/ttyUSB0
+./polsl_iwsk_app_linux /dev/ttyUSB0
+```
 
-#### References:
-- Mielczarek W.: Szeregowe interfejsy cyfrowe, Helion 1993.
-- *Interfejsy w systemach komputerowych cz.1 - Komunikacja przez port znakowy* (Dr inż. Wojciech Mielczarek).
+*Note:* The CMake configuration includes a custom target to automatically cross-compile the Windows `.exe` binary using MinGW.
+
+## References
+- Mielczarek W.: *Szeregowe interfejsy cyfrowe, Helion 1993*
+- Mielczarek W.: *Interfejsy w systemach komputerowych cz.1 - Komunikacja przez port znakowy*
