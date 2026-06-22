@@ -1,3 +1,5 @@
+#define _DEFAULT_SOURCE 1
+
 #include "hal/serial_hal.h"
 
 #include <errno.h>
