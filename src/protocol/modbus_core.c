@@ -66,6 +66,90 @@ uint8_t modbus_calc_lrc(const uint8_t *data, size_t len) {
   return (uint8_t)(-((int8_t)lrc));
 }
 
+uint16_t modbus_calc_crc(const uint8_t *data, size_t len) {
+  uint16_t crc = 0xFFFF;
+  size_t i;
+  int bit;
+
+  if (!data || !len)
+    return crc;
+
+  for (i = 0; i < len; ++i) {
+    crc ^= (uint16_t)data[i];
+    for (bit = 0; bit < 8; ++bit) {
+      if (crc & 0x0001)
+        crc = (uint16_t)((crc >> 1) ^ 0xA001);
+      else
+        crc = (uint16_t)(crc >> 1);
+    }
+  }
+
+  return crc;
+}
+
+int modbus_rtu_encode(const struct modbus_frame *frame, uint8_t *out_buf,
+                      size_t out_size, size_t *out_len) {
+  size_t offset = 0;
+  uint16_t crc;
+
+  if (!frame || !out_buf || !out_len)
+    return -EINVAL;
+
+  if (frame->pdu.data_len > MODBUS_MAX_ADU_SIZE)
+    return -EMSGSIZE;
+
+  /* address (1) + function (1) + data + CRC (2) */
+  if (out_size < 4 + frame->pdu.data_len)
+    return -ENOBUFS;
+
+  out_buf[offset++] = frame->server_address;
+  out_buf[offset++] = frame->pdu.function_code;
+  memcpy(&out_buf[offset], frame->pdu.data, frame->pdu.data_len);
+  offset += frame->pdu.data_len;
+
+  crc = modbus_calc_crc(out_buf, offset);
+  out_buf[offset++] = (uint8_t)(crc & 0xFF);        /* low byte first */
+  out_buf[offset++] = (uint8_t)((crc >> 8) & 0xFF); /* high byte */
+
+  *out_len = offset;
+  return 0;
+}
+
+int modbus_rtu_decode(const uint8_t *in_buf, size_t in_len,
+                      struct modbus_frame *frame) {
+  uint16_t calculated_crc;
+  uint16_t received_crc;
+
+  if (!in_buf || !frame)
+    return -EINVAL;
+
+  memset(frame, 0, sizeof(*frame));
+
+  /* minimum: address(1) + function(1) + CRC(2) */
+  if (in_len < 4)
+    return -EMSGSIZE;
+
+  frame->server_address = in_buf[0];
+  frame->pdu.function_code = in_buf[1];
+  frame->pdu.data_len = in_len - 4;
+  if (frame->pdu.data_len > MODBUS_MAX_ADU_SIZE)
+    return -EMSGSIZE;
+
+  memcpy(frame->pdu.data, &in_buf[2], frame->pdu.data_len);
+
+  received_crc = (uint16_t)(in_buf[in_len - 2] | (in_buf[in_len - 1] << 8));
+  calculated_crc = modbus_calc_crc(in_buf, in_len - 2);
+  frame->checksum = (uint8_t)(received_crc & 0xFF);
+
+  if (calculated_crc != received_crc) {
+    frame->is_valid = false;
+    return -EBADMSG;
+  }
+
+  frame->is_valid = true;
+  return 0;
+}
+
 int modbus_ascii_encode(const struct modbus_frame *frame, char *out_buf,
                         size_t out_size, size_t *out_len) {
   size_t required_size;

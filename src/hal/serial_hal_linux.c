@@ -3,8 +3,34 @@
 #include "hal/serial_hal.h"
 
 #include <errno.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifndef _WIN32
+#include <time.h>
+
+static int g_dbg = -1;
+static int dbg_on(void) {
+  if (g_dbg < 0)
+    g_dbg = getenv("IWSK_DEBUG") ? 1 : 0;
+  return g_dbg;
+}
+static unsigned long dbg_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (unsigned long)(ts.tv_sec * 1000UL + ts.tv_nsec / 1000000UL);
+}
+static void dbg_hex(const char *tag, const void *buf, ssize_t n) {
+  if (!dbg_on())
+    return;
+  fprintf(stderr, "[%lu HAL %s] n=%zd:", dbg_ms(), tag, n);
+  for (ssize_t i = 0; i < n; ++i)
+    fprintf(stderr, " %02X", ((const unsigned char *)buf)[i]);
+  fprintf(stderr, "\n");
+  fflush(stderr);
+}
+#endif /* !_WIN32 (debug helpers) */
 
 #ifdef _WIN32
 
@@ -152,7 +178,10 @@ static int serial_linux_apply_config_fd(int fd,
   if (cfsetospeed(&tio, speed) < 0)
     return -errno;
 
-  if (tcsetattr(fd, TCSANOW, &tio) < 0)
+  /* TCSAFLUSH:
+   * apply after output drains and discard pending input, so baud change
+   * mid-stream does not leave the USB-UART receiver desynchronised */
+  if (tcsetattr(fd, TCSAFLUSH, &tio) < 0)
     return -errno;
 
   return 0;
@@ -186,8 +215,18 @@ serial_linux_apply_flow_control_fd(int fd, enum serial_hal_flow_control flow) {
     return -ENOTSUP;
 #endif
     break;
-  case SERIAL_HAL_FLOW_DTR_DSR:
-    return -ENOTSUP;
+  case SERIAL_HAL_FLOW_DTR_DSR: {
+    /* termios has no native DTR/DSR flow control (only CRTSCTS for RTS/CTS),
+     * so it is emulated in software:
+     * assert DTR to signal we are ready to receive, and gate each transmission
+     * on the peer's DSR (see write()) */
+    int status;
+    if (ioctl(fd, TIOCMGET, &status) == 0) {
+      status |= TIOCM_DTR;
+      ioctl(fd, TIOCMSET, &status);
+    }
+    break;
+  }
   default:
     return -EINVAL;
   }
@@ -196,6 +235,30 @@ serial_linux_apply_flow_control_fd(int fd, enum serial_hal_flow_control flow) {
     return -errno;
 
   return 0;
+}
+
+/**
+ * @brief Wait until the peer signals readiness for software DTR/DSR flow.
+ *
+ * Partner asserts its DTR output to mean "ready".
+ * Null-modem cable routes that line to the local DSR and/or DCD input depending
+ * on the wiring (some cables only bridge DTR->DCD), so readiness is accepted on
+ * either input
+ */
+static int serial_linux_wait_dsr(int fd, uint32_t timeout_ms) {
+  uint32_t waited = 0;
+  int status;
+
+  for (;;) {
+    if (ioctl(fd, TIOCMGET, &status) < 0)
+      return -errno;
+    if (status & (TIOCM_DSR | TIOCM_CAR))
+      return 0;
+    if (waited >= timeout_ms)
+      return -ETIMEDOUT;
+    usleep(2000);
+    waited += 2;
+  }
 }
 
 static int serial_linux_wait_fd(int fd, short events, uint32_t timeout_ms) {
@@ -302,13 +365,33 @@ static ssize_t serial_linux_read(struct serial_hal_device *dev, void *buf,
     return -ENODEV;
 
   ret = serial_linux_wait_fd(ctx->fd, POLLIN, timeout_ms);
-  if (ret)
+  if (ret) {
+    if (dbg_on() && ret != -ETIMEDOUT)
+      fprintf(stderr, "[%lu HAL RX] wait_fd=%d (to=%u)\n", dbg_ms(), ret,
+              timeout_ms);
     return ret;
+  }
 
   bytes = read(ctx->fd, buf, len);
   if (bytes < 0)
     return -errno;
 
+  /* poll() reported POLLIN but read() came back empty:
+   * this is a USB-serial race where the byte lands a few hundred microseconds
+   * later.
+   * Spin briefly so the byte is not skipped (which otherwise corrupts the next
+   * frame) */
+  if (bytes == 0) {
+    int spins;
+    for (spins = 0; spins < 100 && bytes == 0; ++spins) {
+      usleep(100);
+      bytes = read(ctx->fd, buf, len);
+      if (bytes < 0)
+        return -errno;
+    }
+  }
+
+  dbg_hex("RX", buf, bytes);
   return bytes;
 }
 
@@ -328,6 +411,14 @@ static ssize_t serial_linux_write(struct serial_hal_device *dev,
   ctx = dev->priv;
   if (!ctx || !dev->is_open || ctx->fd < 0)
     return -ENODEV;
+
+  /* software DTR/DSR flow control:
+   * hold off until the peer asserts DSR */
+  if (ctx->flow == SERIAL_HAL_FLOW_DTR_DSR) {
+    int ret = serial_linux_wait_dsr(ctx->fd, timeout_ms);
+    if (ret)
+      return ret;
+  }
 
   ptr = buf;
   total = 0;
@@ -360,6 +451,7 @@ static ssize_t serial_linux_write(struct serial_hal_device *dev,
     total += (size_t)written;
   }
 
+  dbg_hex("TX", buf, (ssize_t)total);
   return (ssize_t)total;
 }
 

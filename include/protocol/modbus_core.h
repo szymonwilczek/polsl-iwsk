@@ -68,6 +68,15 @@ struct modbus_frame {
 uint8_t modbus_calc_lrc(const uint8_t *data, size_t len);
 
 /**
+ * @brief Calculate the MODBUS RTU CRC-16 (polynomial 0xA001).
+ *
+ * @param data Buffer containing raw binary bytes (address + PDU).
+ * @param len Number of bytes to process.
+ * @return Computed 16-bit CRC value (to be transmitted low byte first).
+ */
+uint16_t modbus_calc_crc(const uint8_t *data, size_t len);
+
+/**
  * @brief Encode a Modbus frame into an ASCII wire-format buffer.
  *
  * @details
@@ -97,6 +106,33 @@ int modbus_ascii_encode(const struct modbus_frame *frame, char *out_buf,
  */
 int modbus_ascii_decode(const char *in_buf, size_t in_len,
                         struct modbus_frame *frame);
+
+/**
+ * @brief Encode a Modbus frame into an RTU wire-format buffer.
+ *
+ * @details
+ * Layout: address, function, data, CRC-16 (low byte first). No framing chars;
+ * RTU frames are delimited on the wire by a silent interval (>= 3.5 chars).
+ *
+ * @param frame Populated frame to encode.
+ * @param out_buf Buffer for the resulting binary bytes.
+ * @param out_size Size of the output buffer.
+ * @param out_len Pointer to store the final encoded length.
+ * @return 0 on success, negative errno on failure.
+ */
+int modbus_rtu_encode(const struct modbus_frame *frame, uint8_t *out_buf,
+                      size_t out_size, size_t *out_len);
+
+/**
+ * @brief Decode an RTU wire-format buffer into a Modbus frame.
+ *
+ * @param in_buf Raw binary bytes received from transport.
+ * @param in_len Length of the input buffer.
+ * @param frame Pointer to store the decoded frame (is_valid set on good CRC).
+ * @return 0 on success, negative errno on parsing/CRC error.
+ */
+int modbus_rtu_decode(const uint8_t *in_buf, size_t in_len,
+                      struct modbus_frame *frame);
 
 #ifdef __cplusplus
 }

@@ -41,10 +41,13 @@ static void enable_windows_ansi(void) {
   }
 }
 #else
+#include <dirent.h>
 #include <time.h>
 #endif
 
 #define RX_BUFFER_SIZE 1024
+#define PORT_NAME_MAX 32
+#define PORT_LIST_MAX 32
 #define SLAVE_TEXT_MAX 240
 
 struct app_context {
@@ -64,8 +67,10 @@ struct app_context {
   /* reassembly buffer for the passive RS-232 listener (USB UART fragments) */
   uint8_t rx_acc[RX_BUFFER_SIZE];
   size_t rx_acc_len;
+  uint64_t rx_acc_last_ms; /* last time a byte landed in rx_acc */
 
   /* MODBUS station state */
+  enum modbus_mode mb_mode; /* ASCII or RTU */
   enum modbus_role role;
   uint8_t slave_address;               /* 1..247 */
   uint32_t mb_timeout_ms;              /* 0..10000, transaction timeout */
@@ -194,10 +199,83 @@ static ssize_t read_frame_lf(struct app_context *ctx, uint8_t *buf, size_t size,
   return -ENOSPC;
 }
 
+/* Dispatch MODBUS encode/decode/receive on the selected mode (ASCII or RTU) */
+
+static int mb_encode(struct app_context *ctx, const struct modbus_frame *frame,
+                     uint8_t *wire, size_t size, size_t *len) {
+  if (ctx->mb_mode == MODBUS_MODE_RTU)
+    return modbus_rtu_encode(frame, wire, size, len);
+  return modbus_ascii_encode(frame, (char *)wire, size, len);
+}
+
+static int mb_decode(struct app_context *ctx, const uint8_t *buf, size_t len,
+                     struct modbus_frame *frame) {
+  if (ctx->mb_mode == MODBUS_MODE_RTU)
+    return modbus_rtu_decode(buf, len, frame);
+  return modbus_ascii_decode((const char *)buf, len, frame);
+}
+
+/**
+ * @brief MODBUS frame reader:
+ *        wait for the first byte, settle so the whole burst lands in
+ *        the kernel buffer, then drain it.
+ *
+ * Reading byte-by-byte concurrently with arrival makes the PL2303 driver drop
+ * bytes intermittently.
+ * Waiting for the burst to buffer and then draining it in large reads avoids
+ * that race.
+ * ASCII frames end at LF; RTU frames end at the inter-character gap.
+ */
+static ssize_t mb_read_frame(struct app_context *ctx, uint8_t *buf, size_t size,
+                             uint32_t overall_ms, uint32_t gap_ms) {
+  bool want_lf = (ctx->mb_mode != MODBUS_MODE_RTU);
+  uint32_t gap = gap_ms ? gap_ms : 30;
+  if (gap < 20)
+    gap = 20;
+  size_t len = 0;
+  uint64_t deadline = now_ms() + overall_ms;
+
+  /* wait for first byte of the reply */
+  for (;;) {
+    uint64_t t = now_ms();
+    if (t >= deadline)
+      return -ETIMEDOUT;
+    ssize_t n = serial_hal_read(&ctx->dev, buf, 1, (uint32_t)(deadline - t));
+    if (n == -ETIMEDOUT || n == -EAGAIN)
+      return -ETIMEDOUT;
+    if (n < 0)
+      return n;
+    if (n > 0) {
+      len = 1;
+      break;
+    }
+  }
+
+  /* let remainder of the frame arrive into the OS buffer */
+  usleep(60000);
+
+  /* drain buffered burst in large reads */
+  while (len < size) {
+    if (want_lf && memchr(buf, MODBUS_ASCII_LF, len))
+      break;
+    ssize_t n = serial_hal_read(&ctx->dev, buf + len, size - len, gap);
+    if (n == -ETIMEDOUT || n == -EAGAIN)
+      break; /* gap elapsed -> end of frame */
+    if (n < 0)
+      return n;
+    len += (size_t)n;
+  }
+  return (ssize_t)len;
+}
+
+static const char *mb_mode_name(enum modbus_mode m) {
+  return m == MODBUS_MODE_RTU ? "RTU" : "ASCII";
+}
+
 static void slave_send_exception(struct app_context *ctx, uint8_t addr,
                                  uint8_t func, uint8_t exc_code) {
   struct modbus_frame f;
-  char wire[MODBUS_MAX_ADU_SIZE * 2];
+  uint8_t wire[MODBUS_MAX_ADU_SIZE * 2];
   size_t wire_len = 0;
 
   memset(&f, 0, sizeof(f));
@@ -206,18 +284,18 @@ static void slave_send_exception(struct app_context *ctx, uint8_t addr,
   f.pdu.data[0] = exc_code;
   f.pdu.data_len = 1;
 
-  if (modbus_ascii_encode(&f, wire, sizeof(wire), &wire_len) == 0) {
-    print_hex("[SLAVE TX]", (const uint8_t *)wire, wire_len);
+  if (mb_encode(ctx, &f, wire, sizeof(wire), &wire_len) == 0) {
+    print_hex("[SLAVE TX]", wire, wire_len);
     serial_hal_write(&ctx->dev, wire, wire_len, 500);
   }
 }
 
 static void slave_send_normal(struct app_context *ctx,
                               const struct modbus_frame *resp) {
-  char wire[MODBUS_MAX_ADU_SIZE * 2];
+  uint8_t wire[MODBUS_MAX_ADU_SIZE * 2];
   size_t wire_len = 0;
-  if (modbus_ascii_encode(resp, wire, sizeof(wire), &wire_len) == 0) {
-    print_hex("[SLAVE TX]", (const uint8_t *)wire, wire_len);
+  if (mb_encode(ctx, resp, wire, sizeof(wire), &wire_len) == 0) {
+    print_hex("[SLAVE TX]", wire, wire_len);
     serial_hal_write(&ctx->dev, wire, wire_len, 500);
   }
 }
@@ -229,7 +307,7 @@ static void slave_handle_frame(struct app_context *ctx, const uint8_t *raw,
 
   print_hex("\n[SLAVE RX]", raw, raw_len);
 
-  ret = modbus_ascii_decode((const char *)raw, raw_len, &req);
+  ret = mb_decode(ctx, raw, raw_len, &req);
   if (ret == -EPROTO || ret == -EMSGSIZE || ret == -EILSEQ) {
     printf(ANSI_COLOR_YELLOW "[SLAVE] Not a MODBUS frame, ignored.\n"
                              "> " ANSI_COLOR_RESET);
@@ -350,8 +428,19 @@ static void passive_process(struct app_context *ctx, uint8_t *msg, size_t len) {
     return;
   }
 
-  /* PING responder: reply PONG so peer can measure round-trip delay */
-  if (len >= 4 && memcmp(msg, "PING", 4) == 0) {
+  /* PING responder:
+   * Reply PONG so the peer can measure round-trip delay.
+   * Search for "PING" anywhere in the message so a probe is still recognised
+   * even when preceded by garbage
+   */
+  bool is_ping = false;
+  for (size_t i = 0; len >= 4 && i + 4 <= len; ++i) {
+    if (memcmp(msg + i, "PING", 4) == 0) {
+      is_ping = true;
+      break;
+    }
+  }
+  if (is_ping) {
     uint8_t out[16];
     size_t out_len = 0;
     if (rs232_apply_terminator((const uint8_t *)"PONG", 4, &ctx->term, out,
@@ -372,9 +461,15 @@ static void passive_process(struct app_context *ctx, uint8_t *msg, size_t len) {
 static void passive_step(struct app_context *ctx) {
   ssize_t n = serial_hal_read(&ctx->dev, ctx->rx_acc + ctx->rx_acc_len,
                               sizeof(ctx->rx_acc) - 1 - ctx->rx_acc_len, 50);
-  if (n <= 0)
+  if (n <= 0) {
+    /* drop stale, never-terminated partial so the next message starts from
+     * clean buffer */
+    if (ctx->rx_acc_len && now_ms() - ctx->rx_acc_last_ms > 150)
+      ctx->rx_acc_len = 0;
     return;
+  }
   ctx->rx_acc_len += (size_t)n;
+  ctx->rx_acc_last_ms = now_ms();
 
   uint8_t sentinel;
   if (!passive_sentinel(ctx, &sentinel)) {
@@ -409,7 +504,7 @@ static void *rx_worker_thread(void *arg) {
     if (atomic_load(&ctx->slave_mode)) {
       uint8_t frame[RX_BUFFER_SIZE];
       pthread_mutex_lock(&ctx->dev_lock);
-      ssize_t n = read_frame_lf(ctx, frame, sizeof(frame), 300, ctx->mb_gap_ms);
+      ssize_t n = mb_read_frame(ctx, frame, sizeof(frame), 300, ctx->mb_gap_ms);
       if (n > 0)
         slave_handle_frame(ctx, frame, (size_t)n);
       pthread_mutex_unlock(&ctx->dev_lock);
@@ -439,11 +534,11 @@ static void show_config(const struct app_context *ctx) {
          ctx->cfg.data_bits, parity_name(ctx->cfg.parity), ctx->cfg.stop_bits);
   printf("Flow ctrl : %s\n", flow_name(ctx->flow));
   printf("Terminator: %s\n", term_name(ctx->term.mode));
-  printf("MODBUS    : role=%s, slave_addr=%u, timeout=%ums, retries=%u, "
-         "gap=%ums\n",
+  printf("MODBUS    : role=%s, mode=%s, slave_addr=%u, timeout=%ums, "
+         "retries=%u, gap=%ums\n",
          ctx->role == MODBUS_ROLE_MASTER ? "MASTER" : "SLAVE",
-         ctx->slave_address, ctx->mb_timeout_ms, ctx->mb_retries,
-         ctx->mb_gap_ms);
+         mb_mode_name(ctx->mb_mode), ctx->slave_address, ctx->mb_timeout_ms,
+         ctx->mb_retries, ctx->mb_gap_ms);
 }
 
 static void configure_serial(struct app_context *ctx) {
@@ -794,7 +889,7 @@ static void do_ping(struct app_context *ctx) {
 static void master_transaction(struct app_context *ctx) {
   char in[RX_BUFFER_SIZE];
   struct modbus_frame req;
-  char wire[MODBUS_MAX_ADU_SIZE * 2];
+  uint8_t wire[MODBUS_MAX_ADU_SIZE * 2];
   uint8_t rx[RX_BUFFER_SIZE];
   size_t wire_len = 0;
   unsigned addr;
@@ -848,7 +943,7 @@ static void master_transaction(struct app_context *ctx) {
     }
   }
 
-  if (modbus_ascii_encode(&req, wire, sizeof(wire), &wire_len) != 0) {
+  if (mb_encode(ctx, &req, wire, sizeof(wire), &wire_len) != 0) {
     printf(ANSI_COLOR_RED "Failed to encode frame.\n" ANSI_COLOR_RESET);
     return;
   }
@@ -864,7 +959,7 @@ static void master_transaction(struct app_context *ctx) {
     pthread_mutex_lock(&ctx->dev_lock);
     serial_hal_flush(&ctx->dev);
     serial_hal_write(&ctx->dev, wire, wire_len, 1000);
-    print_hex("[MASTER TX]", (const uint8_t *)wire, wire_len);
+    print_hex("[MASTER TX]", wire, wire_len);
 
     if (broadcast) {
       pthread_mutex_unlock(&ctx->dev_lock);
@@ -873,7 +968,13 @@ static void master_transaction(struct app_context *ctx) {
       break;
     }
 
-    ssize_t n = read_frame_lf(ctx, rx, sizeof(rx), timeout, ctx->mb_gap_ms);
+    /* wait for our TX to physically drain before reading
+     * USB-UART can clip the first reply byte if it arrives mid-turnaround,
+     * so delay is scaled to transmitted frame length (~10 bits per byte) */
+    uint32_t drain_us =
+        (uint32_t)((wire_len * 10ULL * 1000000ULL) / ctx->cfg.baud_rate) + 3000;
+    usleep(drain_us);
+    ssize_t n = mb_read_frame(ctx, rx, sizeof(rx), timeout, ctx->mb_gap_ms);
     pthread_mutex_unlock(&ctx->dev_lock);
 
     if (n <= 0) {
@@ -886,7 +987,7 @@ static void master_transaction(struct app_context *ctx) {
 
     print_hex("[MASTER RX]", rx, (size_t)n);
     struct modbus_frame resp;
-    int ret = modbus_ascii_decode((const char *)rx, (size_t)n, &resp);
+    int ret = mb_decode(ctx, rx, (size_t)n, &resp);
     if (ret != 0 || !resp.is_valid) {
       printf(
           ANSI_COLOR_RED
@@ -984,14 +1085,16 @@ static void run_slave_mode(struct app_context *ctx) {
 static void modbus_menu(struct app_context *ctx) {
   char in[32];
   for (;;) {
-    printf("\n" ANSI_COLOR_CYAN "=== MODBUS (role: %s) ===" ANSI_COLOR_RESET
-           "\n",
-           ctx->role == MODBUS_ROLE_MASTER ? "MASTER" : "SLAVE");
+    printf("\n" ANSI_COLOR_CYAN
+           "=== MODBUS (role: %s, mode: %s) ===" ANSI_COLOR_RESET "\n",
+           ctx->role == MODBUS_ROLE_MASTER ? "MASTER" : "SLAVE",
+           mb_mode_name(ctx->mb_mode));
     printf("1. Set role (Master/Slave)\n");
     printf("2. Master: run transaction (func 1 write / 2 read)\n");
     printf("3. Master: set params (timeout/retries/gap)\n");
     printf("4. Slave: set address & gap\n");
     printf("5. Slave: enter listen mode\n");
+    printf("6. Toggle mode (ASCII/RTU)\n");
     printf("b. Back\n> ");
     fflush(stdout);
     if (!read_line(in, sizeof(in)))
@@ -1028,16 +1131,186 @@ static void modbus_menu(struct app_context *ctx) {
         printf(ANSI_COLOR_YELLOW
                "Set role to Slave first (option 1).\n" ANSI_COLOR_RESET);
       break;
+    case '6':
+      ctx->mb_mode = (ctx->mb_mode == MODBUS_MODE_ASCII) ? MODBUS_MODE_RTU
+                                                         : MODBUS_MODE_ASCII;
+      printf(ANSI_COLOR_GREEN "MODBUS mode = %s\n" ANSI_COLOR_RESET,
+             mb_mode_name(ctx->mb_mode));
+      break;
     default:
       break;
     }
   }
 }
 
+/** enumerate serial ports physically present on the system */
+static int list_serial_ports(char ports[][PORT_NAME_MAX], int max) {
+  int count = 0;
+#ifdef _WIN32
+  for (int i = 1; i <= 64 && count < max; ++i) {
+    char path[24];
+    snprintf(path, sizeof(path), "\\\\.\\COM%d", i);
+    HANDLE h = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, 0, NULL,
+                           OPEN_EXISTING, 0, NULL);
+    if (h != INVALID_HANDLE_VALUE) {
+      CloseHandle(h);
+      snprintf(ports[count++], PORT_NAME_MAX, "COM%d", i);
+    }
+  }
+#else
+  static const char *prefix[] = {"ttyUSB", "ttyACM", "ttyS"};
+  DIR *d = opendir("/dev");
+  if (!d)
+    return 0;
+  struct dirent *e;
+  while ((e = readdir(d)) != NULL && count < max) {
+    for (size_t k = 0; k < sizeof(prefix) / sizeof(prefix[0]); ++k) {
+      if (strncmp(e->d_name, prefix[k], strlen(prefix[k])) == 0) {
+        snprintf(ports[count++], PORT_NAME_MAX, "/dev/%.24s", e->d_name);
+        break;
+      }
+    }
+  }
+  closedir(d);
+#endif
+  return count;
+}
+
+/** list present ports, let the user pick one, and reopen device on it */
+static void select_port(struct app_context *ctx) {
+  char ports[PORT_LIST_MAX][PORT_NAME_MAX];
+  char in[64];
+  char old[SERIAL_HAL_DEVICE_NAME_MAX];
+  int n = list_serial_ports(ports, PORT_LIST_MAX);
+
+  if (n == 0) {
+    printf(ANSI_COLOR_RED "No serial ports detected.\n" ANSI_COLOR_RESET);
+    return;
+  }
+  printf("Detected serial ports (presence-checked):\n");
+  for (int i = 0; i < n; ++i)
+    printf("  %d. %s\n", i + 1, ports[i]);
+  printf("Select [1..%d] (current %s): ", n, ctx->cfg.device);
+  fflush(stdout);
+  if (!read_line(in, sizeof(in)) || !in[0])
+    return;
+  int sel = atoi(in);
+  if (sel < 1 || sel > n) {
+    printf(ANSI_COLOR_RED "Invalid selection.\n" ANSI_COLOR_RESET);
+    return;
+  }
+
+  strncpy(old, ctx->cfg.device, sizeof(old) - 1);
+  old[sizeof(old) - 1] = '\0';
+
+  bool was_listening = atomic_load(&ctx->rx_listen);
+  atomic_store(&ctx->rx_listen, false);
+  atomic_store(&ctx->slave_mode, false);
+  usleep(80000);
+  pthread_mutex_lock(&ctx->dev_lock);
+
+  serial_hal_close(&ctx->dev);
+  strncpy(ctx->cfg.device, ports[sel - 1], sizeof(ctx->cfg.device) - 1);
+  ctx->cfg.device[sizeof(ctx->cfg.device) - 1] = '\0';
+
+  int r = serial_hal_open(&ctx->dev, &ctx->cfg);
+  if (r < 0) {
+    strncpy(ctx->cfg.device, old, sizeof(ctx->cfg.device) - 1);
+    serial_hal_open(&ctx->dev, &ctx->cfg);
+    printf(ANSI_COLOR_RED
+           "Failed to open %s (err %d). Reverted to %s.\n" ANSI_COLOR_RESET,
+           ports[sel - 1], r, old);
+  } else {
+    serial_hal_set_flow_control(&ctx->dev, ctx->flow);
+    ctx->current_lines.dtr = true;
+    ctx->current_lines.rts = true;
+    serial_hal_set_modem_lines(&ctx->dev, &ctx->current_lines);
+    printf(ANSI_COLOR_GREEN "Port switched to %s.\n" ANSI_COLOR_RESET,
+           ctx->cfg.device);
+  }
+
+  pthread_mutex_unlock(&ctx->dev_lock);
+  atomic_store(&ctx->rx_listen, was_listening);
+}
+
+/** autobauding: probe baud rates until the peer answers, adopt the match */
+static void autobaud(struct app_context *ctx) {
+  static const uint32_t candidates[] = {1200,  2400,  4800,  9600,
+                                        19200, 38400, 57600, 115200};
+  uint8_t probe[16];
+  uint8_t rx[64];
+  size_t probe_len = 0;
+  uint32_t original = ctx->cfg.baud_rate;
+  bool found = false;
+
+  if (rs232_apply_terminator((const uint8_t *)"PING", 4, &ctx->term, probe,
+                             sizeof(probe), &probe_len) != 0)
+    return;
+
+  printf(ANSI_COLOR_CYAN
+         "[AUTOBAUD] Probing baud rates (peer must be in passive"
+         " listen)...\n" ANSI_COLOR_RESET);
+
+  atomic_store(&ctx->rx_listen, false);
+  atomic_store(&ctx->slave_mode, false);
+  usleep(80000);
+  pthread_mutex_lock(&ctx->dev_lock);
+
+  for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); ++i) {
+    struct serial_hal_config c = ctx->cfg;
+    c.baud_rate = candidates[i];
+    if (serial_hal_set_config(&ctx->dev, &c) != 0)
+      continue;
+    usleep(50000); /* let adapter apply the new baud */
+    serial_hal_flush(&ctx->dev);
+    /* stay silent so the peer's listener drops any garbage it received
+     * from previous (wrong-baud) probe and is ready for clean PING */
+    usleep(350000);
+    serial_hal_flush(&ctx->dev);
+    serial_hal_write(&ctx->dev, probe, probe_len, 500);
+    ssize_t n = read_frame_lf(ctx, rx, sizeof(rx), 1000, 100);
+    bool ok = false;
+    for (ssize_t j = 0; n >= 4 && j + 4 <= n; ++j) {
+      if (memcmp(rx + j, "PONG", 4) == 0) {
+        ok = true;
+        break;
+      }
+    }
+    printf("  %6u baud -> %s\n", candidates[i],
+           ok ? "PONG (match)" : "no reply");
+    if (ok) {
+      ctx->cfg.baud_rate = candidates[i];
+      found = true;
+      break;
+    }
+  }
+
+  if (!found) {
+    struct serial_hal_config c = ctx->cfg;
+    c.baud_rate = original;
+    serial_hal_set_config(&ctx->dev, &c);
+    ctx->cfg.baud_rate = original;
+  }
+
+  pthread_mutex_unlock(&ctx->dev_lock);
+  atomic_store(&ctx->rx_listen, true);
+
+  if (found)
+    printf(ANSI_COLOR_GREEN
+           "[AUTOBAUD] Detected peer baud rate: %u\n" ANSI_COLOR_RESET,
+           ctx->cfg.baud_rate);
+  else
+    printf(ANSI_COLOR_RED
+           "[AUTOBAUD] No peer responded; baud left at %u.\n" ANSI_COLOR_RESET,
+           original);
+}
+
 static void print_menu(void) {
   printf("\n" ANSI_COLOR_CYAN "=== IWSK: RS-232 & MODBUS ===" ANSI_COLOR_RESET
          "\n");
-  printf(" Config : c=serial params  f=flow ctrl  t=terminator  i=info\n");
+  printf(
+      " Config : p=select port  c=serial params  f=flow ctrl  t=terminator\n");
+  printf("          i=info  a=autobaud\n");
   printf(" RS-232 : 1=send text  2=send HEX  3=send file\n");
   printf("          4=transaction(timeout)  5=PING(round-trip)\n");
   printf(" Modem  : d=toggle DTR  r=toggle RTS  l=line status\n");
@@ -1067,10 +1340,11 @@ int main(int argc, char **argv) {
   pthread_mutex_init(&ctx.dev_lock, NULL);
 
   /* MODBUS defaults */
+  ctx.mb_mode = MODBUS_MODE_ASCII;
   ctx.role = MODBUS_ROLE_MASTER;
   ctx.slave_address = 1;
   ctx.mb_timeout_ms = 1000;
-  ctx.mb_retries = 2;
+  ctx.mb_retries = 5;
   ctx.mb_gap_ms = 100;
   strcpy(ctx.slave_text, "Hello from slave");
 
@@ -1138,6 +1412,12 @@ int main(int argc, char **argv) {
       break;
     case 'i':
       show_config(&ctx);
+      break;
+    case 'p':
+      select_port(&ctx);
+      break;
+    case 'a':
+      autobaud(&ctx);
       break;
     case '1':
       send_text(&ctx);

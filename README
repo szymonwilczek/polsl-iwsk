@@ -58,11 +58,15 @@ FEATURES & TUI COMMANDS
 The application provides an interactive menu covering the full assignment.
 
 Link configuration:
+  p  Select serial port: lists the ports present on the system (presence-
+     checked) and reopens the device on the chosen one.
   c  Set transmission parameters: baud (150..115200), data bits (7/8),
      parity (N/E/O), stop bits (1/2). Applied live via set_config.
-  f  Flow control: None / XON-XOFF (software) / RTS-CTS / DTR-DSR (hardware).
+  f  Flow control: None / XON-XOFF (software) / RTS-CTS / DTR-DSR.
   t  Terminator: None / CR / LF / CR-LF / custom 1-2 byte (entered as HEX).
   i  Show current configuration.
+  a  Autobauding: probes the candidate baud rates, pings the peer and adopts
+     the rate at which the peer answers (peer must be in passive listen).
 
 RS-232 transfer:
   1  Send text: payload + configured terminator (window "Nadawanie").
@@ -76,7 +80,8 @@ Modem lines:
   d  Toggle DTR.   r  Toggle RTS.   l  Read DSR/CTS/DCD/RI status.
 
 MODBUS station (menu 'm'):
-  - Select role: Master or Slave.
+  - Select role: Master or Slave; select mode: ASCII (default) or RTU
+    (binary framing with CRC-16, delimited by the inter-character silence).
   - Master: operator-defined frame (slave address, function, arguments),
     automatic LRC + CR-LF, addressed and broadcast (address 0) transactions,
     with timeout (0..10 s), retransmissions (0..5) and inter-character gap
@@ -88,10 +93,13 @@ MODBUS station (menu 'm'):
     odebrany" on the Slave); function 2 reads text Slave->Master.
   - Both stations print every sent and received frame as a HEX dump.
 
-NOTE on flow control: None, XON/XOFF (software) and RTS/CTS (hardware,
-termios CRTSCTS) are fully supported and verified on the PL2303 adapters.
-Automatic DTR/DSR flow control is not offered by termios, so it is reported
-as unsupported; the DTR line is still controllable manually (commands d/l).
+NOTE on flow control: all four modes are supported and verified on the PL2303
+adapters. None, XON/XOFF and RTS/CTS use termios directly (the last via
+CRTSCTS). termios has no native DTR/DSR flow mode, so it is implemented in
+software: the station asserts DTR to advertise readiness and holds off each
+transmission until the partner's readiness line is asserted. A null-modem cable
+may route the partner's DTR to the local DSR and/or DCD input, so either input
+is accepted as "partner ready".
 
 
 VERIFICATION & TEST SCENARIOS
